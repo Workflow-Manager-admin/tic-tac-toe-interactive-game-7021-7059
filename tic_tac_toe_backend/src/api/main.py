@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 from src.api.db import get_db
 from src.api.models import User, Game, Move, BoardState, GameResultEnum
+from src.api.game_logic import (
+    apply_move, BoardResult,
+)
 import hashlib
 import secrets
 
@@ -186,16 +189,50 @@ def get_open_games(db: Session = Depends(get_db)):
 @app.post("/games/{game_id}/moves", response_model=MoveOut, summary="Submit Move", tags=["moves"],
          description="Submit a move for the specified game. Demo: user_id required as query (simulate authentication).")
 def submit_move(game_id: int, move_in: MoveCreate, db: Session = Depends(get_db), user_id: Optional[int] = None):
-    # NOTE: In prod, use token auth to get user! Here for demonstration.
+    """
+    Submit a move with full game logic validation (turn, win, draw, current player, move legality, and board updating).
+    Updates game result if win/tie is detected.
+    """
     uid = user_id if user_id is not None else 1
     game = db.query(Game).filter(Game.id == game_id).first()
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
-    # Check move validity (for demo, simplistic)
-    moves = db.query(Move).filter(Move.game_id == game_id).all()
-    if any(m.cell_index == move_in.cell_index for m in moves):
-        raise HTTPException(status_code=400, detail="Cell already taken.")
-    move_number = len(moves) + 1
+    # Who is which symbol?
+    player1_symbol = "X"
+    if game.player1_id != uid and game.player2_id != uid:
+        raise HTTPException(status_code=403, detail="Player is not in this game.")
+
+    # Only in-progress games can receive moves
+    if game.result != GameResultEnum.in_progress:
+        raise HTTPException(status_code=400, detail="Game already finished.")
+
+    # Retrieve all previous moves (chronological order)
+    moves = db.query(Move).filter(Move.game_id == game_id).order_by(Move.move_number.asc()).all()
+    prior_moves = [
+        {"cell_index": m.cell_index, "symbol": m.symbol, "move_number": m.move_number, "user_id": m.user_id}
+        for m in moves
+    ]
+
+    # Proper turn logic: alternates X/O, correct user for correct symbol
+    last_symbol = prior_moves[-1]["symbol"] if prior_moves else None
+    move_data = {"cell_index": move_in.cell_index, "symbol": move_in.symbol}
+
+    # Enforce symbol turn and user mapping
+    current_turn_symbol = "X" if not prior_moves else ("O" if last_symbol == "X" else "X")
+    if move_in.symbol != current_turn_symbol:
+        raise HTTPException(status_code=400, detail=f"It's {current_turn_symbol}'s turn.")
+
+    # Check user and symbol mapping: player1 always 'X', player2 always 'O'
+    if (move_in.symbol == "X" and uid != game.player1_id) or (move_in.symbol == "O" and uid != game.player2_id):
+        raise HTTPException(status_code=400, detail=f"User not permitted to play as {move_in.symbol} in this game.")
+
+    # Validate move and check game status
+    final_board, result, err = apply_move(prior_moves, move_data, player1_symbol=player1_symbol)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+
+    move_number = len(prior_moves) + 1
+    # -- Save Move --
     move = Move(
         game_id=game_id,
         user_id=uid,
@@ -204,18 +241,25 @@ def submit_move(game_id: int, move_in: MoveCreate, db: Session = Depends(get_db)
         symbol=move_in.symbol
     )
     db.add(move)
-    # -- Save board state representation after move --
-    board = [' '] * 9
-    for m in moves:
-        board[m.cell_index] = m.symbol
-    board[move_in.cell_index] = move_in.symbol
-    state_repr = "".join(board)
+
+    # -- Save Board State after the move --
+    state_repr = "".join(final_board)
     board_state = BoardState(
         game_id=game_id,
         state_repr=state_repr,
         move_number=move_number
     )
     db.add(board_state)
+
+    # -- Update Result if needed --
+    if result == BoardResult.X_WIN:
+        game.result = GameResultEnum.player1_win
+    elif result == BoardResult.O_WIN:
+        game.result = GameResultEnum.player2_win
+    elif result == BoardResult.DRAW:
+        game.result = GameResultEnum.draw
+    # No change if still in_progress.
+
     db.commit()
     db.refresh(move)
     return move
