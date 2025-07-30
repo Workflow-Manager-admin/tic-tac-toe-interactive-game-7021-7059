@@ -1,17 +1,23 @@
-from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi import FastAPI, Depends, HTTPException, Body, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel, Field
-from datetime import datetime
+from datetime import datetime, timedelta
 from src.api.db import get_db
 from src.api.models import User, Game, Move, BoardState, GameResultEnum
 from src.api.game_logic import (
     apply_move, BoardResult,
 )
-import hashlib
-import secrets
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import os
+
+# Constants for JWT setup
+SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret_key_for_prod__replace_me_123")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60*24  # 24 hours
 
 app = FastAPI(
     title="Tic Tac Toe API",
@@ -33,19 +39,53 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==== Utility functions for password hashing (replaceable with passlib etc) ====
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+# ==== Utility functions for password hashing (using passlib) ====
 def hash_password(password: str) -> str:
-    """Simple salted SHA256 (for demonstration only, not production safe)."""
-    salt = secrets.token_hex(8)
-    hash_ = hashlib.sha256((salt + password).encode()).hexdigest()
-    return f"{salt}${hash_}"
+    """Hash the password using bcrypt."""
+    return pwd_context.hash(password)
 
 def verify_password(password: str, hashed: str) -> bool:
+    return pwd_context.verify(password, hashed)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    """Create a signed JWT token, setting expiry."""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta if expires_delta else timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_user_by_username(db: Session, username: str) -> Optional[User]:
+    return db.query(User).filter(User.username == username).first()
+
+def get_user(db: Session, user_id: int) -> Optional[User]:
+    return db.query(User).filter(User.id == user_id).first()
+
+# PUBLIC_INTERFACE
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db)
+) -> User:
+    """Dependency for extracting current user from JWT."""
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     try:
-        salt, hash_ = hashed.split("$")
-        return hashlib.sha256((salt + password).encode()).hexdigest() == hash_
-    except Exception:
-        return False
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user_by_username(db, username=username)
+    if user is None:
+        raise credentials_exception
+    return user
 
 # ==== Pydantic Schemas ====
 
@@ -111,7 +151,7 @@ def health_check():
           description="Register a new user with a username and password.")
 def register(user_in: UserCreate, db: Session = Depends(get_db)):
     # Ensure unique username
-    if db.query(User).filter(User.username == user_in.username).first():
+    if get_user_by_username(db, user_in.username):
         raise HTTPException(status_code=409, detail="Username already exists.")
     new_user = User(
         username=user_in.username,
@@ -125,24 +165,26 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
 # --- User Login ---
 # PUBLIC_INTERFACE
 @app.post("/login", response_model=Token, summary="User Login", tags=["users"],
-          description="Login existing user and get a simple session token (stub, not real JWT/OAuth).")
+          description="Login existing user and get a JWT token. This token must be passed as a bearer token to all protected endpoints.")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user: User = db.query(User).filter(User.username == form_data.username).first()
+    user = get_user_by_username(db, form_data.username)
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials.")
-    # Simple pseudo-token (insecure), replace with JWT or secure session for prod use
-    dummy_token = secrets.token_urlsafe(24)
-    return {"access_token": dummy_token, "token_type": "bearer"}
+    access_token = create_access_token(
+        data={"sub": user.username, "user_id": user.id}
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
 
 # --- Game Creation ---
 # PUBLIC_INTERFACE
 @app.post("/games", response_model=GameOut, summary="Create Game", tags=["games"],
           description="Create a new Tic Tac Toe game. Set 'as_ai' true for solo/AI play (not yet implemented).")
-def create_game(req: GameCreate = Body(...), db: Session = Depends(get_db), user_id: Optional[int] = None):
-    # NOTE: For demo, no real auth; replace 'user_id' with actual current user in production
-    # Simulate user_id; in production use token auth to get current user
-    uid = user_id if user_id is not None else 1
-    new_game = Game(player1_id=uid)
+def create_game(
+    req: GameCreate = Body(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)):
+    # Use actual authenticated user
+    new_game = Game(player1_id=current_user.id)
     db.add(new_game)
     db.commit()
     db.refresh(new_game)
@@ -152,8 +194,12 @@ def create_game(req: GameCreate = Body(...), db: Session = Depends(get_db), user
 # PUBLIC_INTERFACE
 @app.post("/games/{game_id}/join", response_model=GameOut, summary="Join Game", tags=["games"],
           description="Join an open Tic Tac Toe game as the second player.")
-def join_game(game_id: int, db: Session = Depends(get_db), user_id: Optional[int] = None):
-    uid = user_id if user_id is not None else 2
+def join_game(
+    game_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    uid = current_user.id
     game = db.query(Game).filter(Game.id == game_id).first()
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
@@ -168,9 +214,13 @@ def join_game(game_id: int, db: Session = Depends(get_db), user_id: Optional[int
 
 # --- Get User's Active Games ---
 # PUBLIC_INTERFACE
-@app.get("/users/{user_id}/games", response_model=List[GameOut], summary="User's Games", tags=["games"],
-         description="Get all games for a given user.")
-def get_games_for_user(user_id: int, db: Session = Depends(get_db)):
+@app.get("/users/me/games", response_model=List[GameOut], summary="User's Games", tags=["games"],
+         description="Get all games for the current authenticated user.")
+def get_games_for_user(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    user_id = current_user.id
     games = db.query(Game).filter(
         (Game.player1_id == user_id) | (Game.player2_id == user_id)
     ).order_by(Game.created_at.desc()).all()
@@ -187,19 +237,24 @@ def get_open_games(db: Session = Depends(get_db)):
 # --- Submit Move ---
 # PUBLIC_INTERFACE
 @app.post("/games/{game_id}/moves", response_model=MoveOut, summary="Submit Move", tags=["moves"],
-         description="Submit a move for the specified game. Demo: user_id required as query (simulate authentication).")
-def submit_move(game_id: int, move_in: MoveCreate, db: Session = Depends(get_db), user_id: Optional[int] = None):
+         description="Submit a move for the specified game. Must be authenticated user.")
+def submit_move(
+    game_id: int,
+    move_in: MoveCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """
     Submit a move with full game logic validation (turn, win, draw, current player, move legality, and board updating).
     Updates game result if win/tie is detected.
     """
-    uid = user_id if user_id is not None else 1
+    uid = current_user.id
     game = db.query(Game).filter(Game.id == game_id).first()
     if not game:
         raise HTTPException(status_code=404, detail="Game not found.")
     # Who is which symbol?
     player1_symbol = "X"
-    if game.player1_id != uid and game.player2_id != uid:
+    if game.player1_id != uid and (game.player2_id != uid if game.player2_id else True):
         raise HTTPException(status_code=403, detail="Player is not in this game.")
 
     # Only in-progress games can receive moves
@@ -223,7 +278,7 @@ def submit_move(game_id: int, move_in: MoveCreate, db: Session = Depends(get_db)
         raise HTTPException(status_code=400, detail=f"It's {current_turn_symbol}'s turn.")
 
     # Check user and symbol mapping: player1 always 'X', player2 always 'O'
-    if (move_in.symbol == "X" and uid != game.player1_id) or (move_in.symbol == "O" and uid != game.player2_id):
+    if (move_in.symbol == "X" and uid != game.player1_id) or (move_in.symbol == "O" and (game.player2_id is None or uid != game.player2_id)):
         raise HTTPException(status_code=400, detail=f"User not permitted to play as {move_in.symbol} in this game.")
 
     # Validate move and check game status
