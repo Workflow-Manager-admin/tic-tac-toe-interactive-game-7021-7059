@@ -1,8 +1,8 @@
-from fastapi import FastAPI, Depends, HTTPException, Body, status
+from fastapi import FastAPI, Depends, HTTPException, Body, status, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List, Optional, Dict
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
 from src.api.db import get_db
@@ -13,6 +13,7 @@ from src.api.game_logic import (
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import os
+import asyncio
 
 # Constants for JWT setup
 SECRET_KEY = os.getenv("SECRET_KEY", "change_this_secret_key_for_prod__replace_me_123")
@@ -27,9 +28,51 @@ app = FastAPI(
         {"name": "users", "description": "User registration and authentication"},
         {"name": "games", "description": "Game management"},
         {"name": "moves", "description": "Moving and board state"},
-        {"name": "utility", "description": "Health and support"}
+        {"name": "utility", "description": "Health and support"},
+        {"name": "realtime", "description": "WebSocket endpoints for real-time updates"},
     ]
 )
+
+# === WebSocket Connection Manager ===
+
+class ConnectionManager:
+    """
+    Handles WebSocket connections per game. Allows broadcast to all participants
+    viewing the same game.
+    """
+    def __init__(self):
+        # game_id: set of WebSockets
+        self.active_connections: Dict[int, set] = {}
+
+    # PUBLIC_INTERFACE
+    async def connect(self, game_id: int, websocket: WebSocket):
+        await websocket.accept()
+        if game_id not in self.active_connections:
+            self.active_connections[game_id] = set()
+        self.active_connections[game_id].add(websocket)
+
+    # PUBLIC_INTERFACE
+    def disconnect(self, game_id: int, websocket: WebSocket):
+        conns = self.active_connections.get(game_id)
+        if conns and websocket in conns:
+            conns.remove(websocket)
+            if not conns:
+                del self.active_connections[game_id]
+
+    # PUBLIC_INTERFACE
+    async def broadcast(self, game_id: int, message: dict):
+        conns = self.active_connections.get(game_id, set())
+        removals = []
+        for conn in conns:
+            try:
+                await conn.send_json(message)
+            except Exception:
+                removals.append(conn)
+        for conn in removals:
+            conns.remove(conn)
+
+ws_manager = ConnectionManager()
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,6 +180,64 @@ class BoardStateOut(BaseModel):
     created_at: datetime
     class Config:
         orm_mode = True
+# ======================== WEBSOCKET REAL-TIME ROUTES ========================
+# PUBLIC_INTERFACE
+@app.websocket("/ws/games/{game_id}")
+async def websocket_endpoint(websocket: WebSocket, game_id: int):
+    """
+    WebSocket endpoint for real-time updates to board state and move history.
+    Client should join with game_id in the path.
+    On board/move update, server broadcasts update to all connected clients.
+    """
+    await ws_manager.connect(game_id, websocket)
+    try:
+        # On connect, send the latest board state and full move history to sync the client.
+        db = next(get_db())
+        latest_board = (
+            db.query(BoardState)
+            .filter(BoardState.game_id == game_id)
+            .order_by(BoardState.move_number.desc())
+            .first()
+        )
+        moves = db.query(Move).filter(Move.game_id == game_id).order_by(Move.move_number.asc()).all()
+        await websocket.send_json({
+            "type": "init",
+            "board_state": latest_board.state_repr if latest_board else " " * 9,
+            "move_history": [
+                {
+                    "move_number": m.move_number,
+                    "cell_index": m.cell_index,
+                    "symbol": m.symbol,
+                    "user_id": m.user_id,
+                    "created_at": m.created_at.isoformat(),
+                } for m in moves
+            ]
+        })
+        # Main message loop: currently just ping, ready for future client actions.
+        while True:
+            _ = await websocket.receive_text()
+            # Optional: Echo/ping/pong or ignore.
+    except WebSocketDisconnect:
+        ws_manager.disconnect(game_id, websocket)
+    except Exception:
+        ws_manager.disconnect(game_id, websocket)
+
+# PUBLIC_INTERFACE
+@app.get("/docs/websocket", tags=["realtime"], summary="WebSocket Usage Help")
+def websocket_info():
+    """
+    API documentation/help endpoint describing how to use the /ws/games/{game_id} WebSocket.
+    """
+    return {
+        "websocket_url": "/ws/games/{game_id}",
+        "summary": "Connect with this endpoint to receive real-time board state and move history updates for a game.",
+        "usage_notes": [
+            "Send a WebSocket connection to this endpoint, replacing {game_id} with your target game.",
+            "On connect, you'll receive a 'type': 'init' message with latest board and move history.",
+            "Whenever the board or moves change (via any player move), all connected clients receive an 'update' event.",
+            "Each update includes the new board and updated history.",
+        ]
+    }
 
 # ======================== ROUTES ========================
 
@@ -317,7 +418,40 @@ def submit_move(
 
     db.commit()
     db.refresh(move)
+    # Real-time board/move broadcast via WebSocket
+    # Avoid blocking the response: schedule (fire-and-forget) update
+    asyncio.create_task(broadcast_game_update(game_id, db))
     return move
+
+# --- Helper: Broadcast an update to all real-time clients in a game ---
+async def broadcast_game_update(game_id: int, db: Session = None):
+    """Send board state and move history to all WS clients for a game."""
+    provided_db = db is not None
+    if not provided_db:
+        db = next(get_db())
+    latest_board = (
+        db.query(BoardState)
+        .filter(BoardState.game_id == game_id)
+        .order_by(BoardState.move_number.desc())
+        .first()
+    )
+    moves = db.query(Move).filter(Move.game_id == game_id).order_by(Move.move_number.asc()).all()
+    msg = {
+        "type": "update",
+        "board_state": latest_board.state_repr if latest_board else " " * 9,
+        "move_history": [
+            {
+                "move_number": m.move_number,
+                "cell_index": m.cell_index,
+                "symbol": m.symbol,
+                "user_id": m.user_id,
+                "created_at": m.created_at.isoformat(),
+            } for m in moves
+        ]
+    }
+    await ws_manager.broadcast(game_id, msg)
+    if not provided_db:
+        db.close()
 
 # --- Get Board State ---
 # PUBLIC_INTERFACE
